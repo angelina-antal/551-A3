@@ -1,13 +1,7 @@
 explore/
 commands.txt
-datasets/*.npy
-datasets/processed_*.npz
-datasets/preprocess_*.npz
-datasets/preprocess_*.json
-!datasets/.gitkeep
-
-# Generated
-predicted_labels.csv
+datasets/
+src/net.py
 # OS files
 .DS_Store
 Thumbs.db

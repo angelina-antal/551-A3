@@ -1,443 +1,736 @@
 import argparse
+import copy
+import csv
 import os
 import random
-from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+from src.folds import make_stratified_folds
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-import json
-
-from src.augment import CenteredAugConfig, CenteredOddOneOutAugment, OddOneOutDataset
-from src.preprocess import PreprocessConfig
-
-
-# ---------------------------------------------------------------------------
-# constants — change these in ONE place and everything stays consistent
-# ---------------------------------------------------------------------------
-CNN_EMB   = 20   # TinyCNN output dim
-META_OUT  = 12   # meta MLP output dim
-D_MODEL   = 24   # shared set-level embedding dim
-K         = 6    # number of archetypes
-REL_DIM   = 10   # pairwise relation dim
-
-# derived — do NOT edit, computed from the above
-_ITEM_IN      = CNN_EMB + META_OUT          # 32
-_PAIR_IN      = 3 * D_MODEL + 2            # 74  (xi, xj, |ci-cj|, q_overlap, coord_dist)
-_SCORER_IN    = 5 * D_MODEL + 2 * REL_DIM + K  # 146
+from augment_edge import CenteredAugConfig, CenteredOddOneOutAugment
+from preprocess_edges import (
+    PreprocessConfig,
+    apply_normalization,
+    compute_train_stats,
+    preprocess_dataset,
+)
 
 
-# ---------------------------------------------------------------------------
-# utilities
-# ---------------------------------------------------------------------------
+# -----------------------------
+# Utilities
+# -----------------------------
 
-def seed_everything(seed: int = 42):
+
+def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def generate_csv_kaggle(yh_test: np.ndarray, out_path: str = "predicted_labels.csv"):
-    import pandas as pd
-    df = pd.DataFrame({"Id": np.arange(len(yh_test)), "Category": yh_test.astype(int)})
-    df.to_csv(out_path, index=False)
+def count_trainable_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-# ---------------------------------------------------------------------------
-# dataset  (centered_raw + meta only)
-# ---------------------------------------------------------------------------
 
-class DictDataset(Dataset):
-    def __init__(self, arrays: dict, y=None, train: bool = False):
-        self.arrays = arrays
-        self.y      = None if y is None else y.astype(np.int64)
+def maybe_to_tensor(x: np.ndarray) -> torch.Tensor:
+    if x.dtype == np.float64:
+        x = x.astype(np.float32)
+    if x.dtype == np.int32:
+        x = x.astype(np.int64)
+    return torch.from_numpy(x)
+
+
+# -----------------------------
+# Datasets
+# -----------------------------
+
+
+class GroupDataset(Dataset):
+    def __init__(
+        self,
+        arrays: Dict[str, np.ndarray],
+        labels: Optional[np.ndarray] = None,
+    ) -> None:
+        self.centered_raw = arrays["centered_raw"].astype(np.float32)
+        self.meta = arrays["meta"].astype(np.float32)
+        self.labels = None if labels is None else labels.astype(np.int64)
+
+        assert self.centered_raw.ndim == 4, f"Expected [N, 5, H, W], got {self.centered_raw.shape}"
+        assert self.meta.ndim == 3, f"Expected [N, 5, M], got {self.meta.shape}"
+        assert self.centered_raw.shape[:2] == self.meta.shape[:2]
+
+    def __len__(self) -> int:
+        return self.centered_raw.shape[0]
+
+    def __getitem__(self, idx: int):
+        sample = {
+            "centered_raw": maybe_to_tensor(self.centered_raw[idx]),
+            "meta": maybe_to_tensor(self.meta[idx]),
+        }
+        if self.labels is not None:
+            sample["label"] = torch.tensor(self.labels[idx], dtype=torch.long)
+        return sample
+
+
+class AugmentedTrainDataset(Dataset):
+    def __init__(self, x: np.ndarray, y: np.ndarray, augment: CenteredOddOneOutAugment):
+        self.x = x.astype(np.float32)
+        self.y = y.astype(np.int64)
+        self.augment = augment
 
     def __len__(self):
-        return len(self.arrays["centered_raw"])
+        return len(self.x)
 
     def __getitem__(self, idx):
-        sample = {
-            "centered_raw":       self.arrays["centered_raw"][idx].copy().astype(np.float32),
-            "meta":               self.arrays["meta"][idx].copy().astype(np.float32),
+        imgs = self.x[idx]
+        label = int(self.y[idx])
+        imgs, meta, label = self.augment(imgs, label)
+        return {
+            "centered_raw": torch.from_numpy(imgs),
+            "meta": torch.from_numpy(meta),
+            "label": torch.tensor(label, dtype=torch.long),
         }
 
-        sample["centered_raw"] = (sample["centered_raw"])
-        sample["meta"]         = (sample["meta"])
 
-        if self.y is None:
-            return {k: torch.from_numpy(v) for k, v in sample.items()}
+# -----------------------------
+# Model
+# -----------------------------
 
-        label = int(self.y[idx])
 
-        return (
-            {k: torch.from_numpy(v) for k, v in sample.items()},
-            torch.tensor(label, dtype=torch.long),
+class ConvBNAct(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
         )
 
-
-def load_npz_arrays(path: str) -> dict:
-    z = np.load(path, allow_pickle=True)
-    return {k: z[k] for k in z.files if k != "meta_names"}
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
 
 
-# ---------------------------------------------------------------------------
-# model components
-# ---------------------------------------------------------------------------
-
-class TinyCNN(nn.Module):
-    """Encodes a (2, H, W) image+mask pair → CNN_EMB-dim vector."""
-
-    def __init__(self, in_ch: int = 1, emb_dim: int = CNN_EMB):
+class TinyCNNEncoder(nn.Module):
+    def __init__(self, emb_dim: int = 16):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 8, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2),   # → 16
-            nn.Conv2d(8, 12, 3, padding=1),    nn.ReLU(inplace=True), nn.MaxPool2d(2),   # → 8
-            nn.Conv2d(12, 16, 3, padding=1),   nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d(1),
+        self.stem = nn.Sequential(
+            ConvBNAct(1, 12, stride=1),
+            ConvBNAct(12, 16, stride=2),
+            ConvBNAct(16, 24, stride=1),
+            ConvBNAct(24, 24, stride=2),
+            ConvBNAct(24, 24, stride=1),
+            nn.AdaptiveAvgPool2d(1),
         )
-        self.fc = nn.Linear(16, emb_dim)
+        self.proj = nn.Linear(24, emb_dim)
 
-    def forward(self, x):                       # x: [B*N, 2, H, W]
-        return self.fc(self.net(x).flatten(1))  # → [B*N, emb_dim]
-
-
-class ArchetypeModule(nn.Module):
-    def __init__(self, d_model: int = D_MODEL, num_archetypes: int = K):
-        super().__init__()
-        self.centers   = nn.Parameter(torch.randn(num_archetypes, d_model) * 0.02)
-        self.to_logits = nn.Linear(d_model, num_archetypes)
-
-    def forward(self, x):                               # x: [B, N, D]
-        q      = F.softmax(self.to_logits(x), dim=-1)  # [B, N, K]
-        center = torch.matmul(q, self.centers)          # [B, N, D]
-        coord  = x - center                             # family-relative residual
-        return q, center, coord
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.stem(x).flatten(1)
+        return self.proj(h)
 
 
 class SetBlock(nn.Module):
-    def __init__(self, d_model: int = D_MODEL, heads: int = 2, dropout: float = 0.1):
+    def __init__(self, d_model: int = 16, heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.attn  = nn.MultiheadAttention(d_model, heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
-        self.ff    = nn.Sequential(
-            nn.Linear(d_model, d_model * 2), nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model),
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=heads,
+            dropout=dropout,
+            batch_first=True,
         )
         self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        a, _ = self.attn(x, x, x, need_weights=False)
-        x    = self.norm1(x + a)
-        return self.norm2(x + self.ff(x))
-
-
-class PairwiseAggregator(nn.Module):
-    """
-    Computes per-item features by aggregating pairwise relations.
-    Input dim = 3*D_MODEL + 2  (xi, xj, |ci-cj|, q_overlap, coord_dist)
-    """
-
-    def __init__(self, d_model: int = D_MODEL, rel_dim: int = REL_DIM):
-        super().__init__()
-        pair_in = 3 * d_model + 2          # 74 with defaults
-        self.rel = nn.Sequential(
-            nn.Linear(pair_in, rel_dim), nn.ReLU(inplace=True),
-            nn.Linear(rel_dim, rel_dim),   nn.ReLU(inplace=True),
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * d_model, d_model),
+            nn.Dropout(dropout),
         )
 
-    def forward(self, x, q, coord):
-        # x, coord: [B, N, D]   q: [B, N, K]
-        B, N, D = x.shape
-
-        xi = x.unsqueeze(2).expand(B, N, N, D)    # [B, N, N, D]
-        xj = x.unsqueeze(1).expand(B, N, N, D)
-        ci = coord.unsqueeze(2).expand(B, N, N, D)
-        cj = coord.unsqueeze(1).expand(B, N, N, D)
-
-        q_overlap  = (q.unsqueeze(2) * q.unsqueeze(1)).sum(-1, keepdim=True)   # [B,N,N,1]
-        coord_dist = torch.norm(ci - cj, dim=-1, keepdim=True)                 # [B,N,N,1]
-
-        feat = torch.cat([xi, xj, torch.abs(ci - cj), q_overlap, coord_dist], dim=-1)
-        # feat: [B, N, N, 3*D+2]  ← correct by construction
-        rel = self.rel(feat)   # [B, N, N, rel_dim]
-
-        eye      = torch.eye(N, device=x.device, dtype=torch.bool).view(1, N, N, 1)
-        rel_mean = rel.masked_fill(eye, 0.0).sum(2) / float(N - 1)       # [B, N, rel_dim]
-        rel_max  = rel.masked_fill(eye, -1e9).max(2).values              # [B, N, rel_dim]
-        return rel_mean, rel_max
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        x = x + attn_out
+        x = x + self.ff(self.norm2(x))
+        return x
 
 
-class OddOneOutNet(nn.Module):
-    """
-    Centered-only relational network for 5-way odd-one-out.
-
-    Input keys (per batch):
-        centered_raw        [B, 5, H, W]   (float32, normalised)
-        meta                [B, 5, meta_dim]
-    """
-
-    def __init__(self, meta_dim: int):
+class RelationOddOneOutNet(nn.Module):
+    def __init__(
+        self,
+        meta_dim: int,
+        cnn_dim: int = 16,
+        meta_out: int = 8,
+        d_model: int = 16,
+        dropout: float = 0.10,
+    ) -> None:
         super().__init__()
-
-        self.encoder  = TinyCNN(in_ch=1, emb_dim=CNN_EMB)
-
+        self.cnn = TinyCNNEncoder(emb_dim=cnn_dim)
         self.meta_mlp = nn.Sequential(
-            nn.Linear(meta_dim, META_OUT), nn.ReLU(inplace=True),
-            nn.Linear(META_OUT, META_OUT),
+            nn.Linear(meta_dim, meta_out),
+            nn.GELU(),
+            nn.LayerNorm(meta_out),
         )
-
-        # _ITEM_IN = CNN_EMB + META_OUT = 32
-        self.item_proj = nn.Sequential(
-            nn.Linear(_ITEM_IN, D_MODEL), nn.ReLU(inplace=True),
-            nn.Linear(D_MODEL, D_MODEL),
+        self.fuse = nn.Sequential(
+            nn.Linear(cnn_dim + meta_out, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
         )
-
-        self.archetypes = ArchetypeModule(d_model=D_MODEL, num_archetypes=K)
-        self.set_block  = SetBlock(d_model=D_MODEL, heads=2, dropout=0.1)
-        self.pair       = PairwiseAggregator(d_model=D_MODEL, rel_dim=REL_DIM)
-
-        # _SCORER_IN = 5*D_MODEL + 2*REL_DIM + K = 146
+        self.set_blocks = nn.Sequential(
+            SetBlock(d_model=d_model, heads=4, dropout=dropout),
+            SetBlock(d_model=d_model, heads=4, dropout=dropout),
+        )
         self.scorer = nn.Sequential(
-            nn.Linear(_SCORER_IN, 40), nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(40, 1),
+            nn.Linear(5 * d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1),
         )
 
-    def _encode(self, gray):
-        B, N, H, W = gray.shape
-        x = gray.reshape(B * N, 1, H, W)
-        return self.encoder(x).view(B, N, -1)
+    def encode_items(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        x = batch["centered_raw"]
+        meta = batch["meta"]
+        b, k, h, w = x.shape
+        x = x.view(b * k, 1, h, w)
+        img_feat = self.cnn(x).view(b, k, -1)
+        meta_feat = self.meta_mlp(meta)
+        h0 = self.fuse(torch.cat([img_feat, meta_feat], dim=-1))
+        return self.set_blocks(h0)
 
-    def forward(self, batch):
-        z_cen  = self._encode(batch["centered_raw"])
+    def forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        h = self.encode_items(batch)
+        b, k, d = h.shape
+        assert k == 5, f"Expected K=5 items, got {k}"
 
-        B      = batch["meta"].shape[0]
-        z_meta = self.meta_mlp(batch["meta"].view(-1, batch["meta"].shape[-1])).view(B, 5, -1)
+        sum_all = h.sum(dim=1, keepdim=True)
+        mean_others = (sum_all - h) / float(k - 1)
 
-        h0 = self.item_proj(torch.cat([z_cen, z_meta], dim=-1))   # [B, 5, D_MODEL]
+        others_max = []
+        for i in range(k):
+            mask = [j for j in range(k) if j != i]
+            others_max.append(h[:, mask, :].max(dim=1).values)
+        max_others = torch.stack(others_max, dim=1)
 
-        q, center, coord = self.archetypes(h0)
-        h = self.set_block(h0 + center)
-
-        # mean of the other 4 items for each position
-        mean_other = torch.stack([
-            torch.cat([h[:, :i], h[:, i+1:]], dim=1).mean(1)
-            for i in range(5)
-        ], dim=1)   # [B, 5, D_MODEL]
-
-        rel_mean, rel_max = self.pair(h, q, coord)
-
-        feat = torch.cat([
-            h0,                      # per-item identity     [B,5,D]
-            h,                       # contextualised        [B,5,D]
-            center,                  # family centre         [B,5,D]
-            coord,                   # family residual       [B,5,D]
-            torch.abs(h - mean_other),  # deviation          [B,5,D]
-            rel_mean,                # avg pairwise          [B,5,REL_DIM]
-            rel_max,                 # max pairwise          [B,5,REL_DIM]
-            q,                       # archetype weights     [B,5,K]
-        ], dim=-1)
-        # feat: [B, 5, 5*D_MODEL + 2*REL_DIM + K] = [B, 5, 146]
-
-        logits = self.scorer(feat).squeeze(-1)   # [B, 5]
-        return logits, q
+        feats = torch.cat(
+            [
+                h,
+                mean_others,
+                max_others,
+                torch.abs(h - mean_others),
+                h * mean_others,
+            ],
+            dim=-1,
+        )
+        logits = self.scorer(feats).squeeze(-1)
+        return logits
 
 
-# ---------------------------------------------------------------------------
-# train / evaluate / predict
-# ---------------------------------------------------------------------------
+# -----------------------------
+# Training / eval
+# -----------------------------
 
-def train_epoch(model, loader, optimizer, device):
-    model.train()
-    ce = nn.CrossEntropyLoss(label_smoothing=0.05)
-    total_loss, total_correct, total = 0.0, 0, 0
 
-    for batch, y in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        y     = y.to(device)
-
-        optimizer.zero_grad()
-        logits, q = model(batch)
-
-        loss_main = ce(logits, y)
-
-        # entropy bonus: encourage diverse archetype usage
-        mean_q  = q.mean(dim=(0, 1))
-        entropy = -(mean_q * (mean_q + 1e-8).log()).sum()
-        loss    = loss_main - 0.01 * entropy
-
-        loss.backward()
-        optimizer.step()
-
-        total_loss    += loss.item() * y.size(0)
-        total_correct += (logits.argmax(1) == y).sum().item()
-        total         += y.size(0)
-
-    return total_loss / total, total_correct / total
+def move_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
+    return {k: v.to(device) for k, v in batch.items()}
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def predict_logits_tta(model: nn.Module, batch: Dict[str, torch.Tensor], tta_perms: int = 1) -> torch.Tensor:
+    if tta_perms <= 1:
+        return model(batch)
+
+    x = batch["centered_raw"]
+    meta = batch["meta"]
+    device = x.device
+    b, k = x.shape[:2]
+    acc = torch.zeros(b, k, device=device)
+
+    arange_b = torch.arange(b, device=device)[:, None]
+    for _ in range(tta_perms):
+        perm = torch.stack([torch.randperm(k, device=device) for _ in range(b)], dim=0)
+        inv = torch.argsort(perm, dim=1)
+        xb = x[arange_b, perm]
+        mb = meta[arange_b, perm]
+        logits = model({"centered_raw": xb, "meta": mb})
+        logits = logits[arange_b, inv]
+        acc += logits
+    return acc / float(tta_perms)
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, tta_perms: int = 1) -> Tuple[float, float]:
     model.eval()
     ce = nn.CrossEntropyLoss()
-    total_loss, total_correct, total = 0.0, 0, 0
+    total_loss = 0.0
+    total_correct = 0
+    total = 0
 
-    for batch, y in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        y     = y.to(device)
-        logits, _ = model(batch)
-        total_loss    += ce(logits, y).item() * y.size(0)
-        total_correct += (logits.argmax(1) == y).sum().item()
-        total         += y.size(0)
+    for batch in loader:
+        batch = move_batch(batch, device)
+        y = batch["label"]
+        logits = predict_logits_tta(model, batch, tta_perms=tta_perms)
+        loss = ce(logits, y)
 
-    return total_loss / total, total_correct / total
+        total_loss += loss.item() * y.size(0)
+        total_correct += (logits.argmax(dim=1) == y).sum().item()
+        total += y.size(0)
+
+    return total_loss / max(total, 1), total_correct / max(total, 1)
 
 
 @torch.no_grad()
-def predict(model, loader, device):
+def predict(model: nn.Module, loader: DataLoader, device: torch.device, tta_perms: int = 8) -> np.ndarray:
     model.eval()
     preds = []
     for batch in loader:
-        if isinstance(batch, (list, tuple)):
-            batch = batch[0]
-        batch  = {k: v.to(device) for k, v in batch.items()}
-        logits, _ = model(batch)
-        preds.append(logits.argmax(1).cpu().numpy())
-    return np.concatenate(preds)
+        batch = move_batch(batch, device)
+        logits = predict_logits_tta(model, batch, tta_perms=tta_perms)
+        preds.append(logits.argmax(dim=1).cpu().numpy())
+    return np.concatenate(preds, axis=0)
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
+@torch.no_grad()
+def collect_per_sample_losses(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
+    model.eval()
+    ce = nn.CrossEntropyLoss(reduction="none")
+    losses = []
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir",    type=str,   default="datasets")
-    parser.add_argument("--train-npz",   type=str,   default="datasets/processed_train_best.npz")
-    parser.add_argument("--test-npz",    type=str,   default="datasets/processed_test_best.npz")
-    parser.add_argument("--epochs",      type=int,   default=80)
-    parser.add_argument("--batch-size",  type=int,   default=64)
-    parser.add_argument("--lr",          type=float, default=2e-3)
-    parser.add_argument("--weight-decay",type=float, default=1e-4)
-    parser.add_argument("--val-size",    type=float, default=0.2)
-    parser.add_argument("--patience",    type=int,   default=20)
-    parser.add_argument("--seed",        type=int,   default=42)
-    parser.add_argument("--num-workers", type=int,   default=0)
-    parser.add_argument("--save-path",   type=str,   default="best_model.pt")
-    args = parser.parse_args()
+    for batch in loader:
+        batch = move_batch(batch, device)
+        y = batch["label"]
+        logits = model(batch)
+        loss = ce(logits, y)
+        losses.append(loss.cpu().numpy())
 
-    seed_everything(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("device:", device)
+    return np.concatenate(losses, axis=0)
 
-    y_train = np.load(os.path.join(args.data_dir, "y_train.npy"))
-    x_train_raw = np.load(os.path.join(args.data_dir, "x_train.npy"))
 
-    arrays = load_npz_arrays(args.train_npz)   # normalized processed train, used for val split
-    meta_dim = arrays["meta"].shape[-1]
+def make_stage2_sampler(
+    losses: np.ndarray,
+    hard_fraction: float,
+    hard_weight: float,
+    easy_weight: float = 1.0,
+) -> Tuple[WeightedRandomSampler, np.ndarray, float]:
+    n = len(losses)
+    k = max(1, int(np.ceil(n * hard_fraction)))
+    hard_idx = np.argsort(losses)[-k:]
 
-    idx = np.arange(len(y_train))
-    tr_idx, va_idx, y_tr, y_va = train_test_split(
-        idx, y_train, test_size=args.val_size, random_state=args.seed, stratify=y_train,
+    is_hard = np.zeros(n, dtype=bool)
+    is_hard[hard_idx] = True
+
+    weights = np.full(n, easy_weight, dtype=np.float64)
+    weights[is_hard] = hard_weight
+
+    sampler = WeightedRandomSampler(
+        weights=torch.from_numpy(weights),
+        num_samples=n,
+        replacement=True,
     )
+    threshold = float(losses[hard_idx].min())
+    return sampler, is_hard, threshold
 
-    def slice_arrays(arrs, inds):
-        return {
-            k: v[inds] if (isinstance(v, np.ndarray) and v.shape[0] == len(y_train)) else v
-            for k, v in arrs.items()
-        }
 
-    # load preprocess config + normalization stats
-    with open(os.path.join(args.data_dir, "preprocess_config_best.json"), "r", encoding="utf-8") as f:
-        preprocess_cfg = PreprocessConfig(**json.load(f))
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    grad_clip: float,
+    hard_mining_frac: float = 1.0,
+) -> Tuple[float, float]:
+    model.train()
+    ce = nn.CrossEntropyLoss(reduction="none")
+    total_loss = 0.0
+    total_correct = 0
+    total = 0
 
-    stats_npz = np.load(os.path.join(args.data_dir, "preprocess_stats_best.npz"))
-    norm_stats = {
-        "centered_raw_mean": np.float32(stats_npz["centered_raw_mean"]),
-        "centered_raw_std": np.float32(stats_npz["centered_raw_std"]),
-        "meta_mean": stats_npz["meta_mean"].astype(np.float32),
-        "meta_std": stats_npz["meta_std"].astype(np.float32),
-    }
+    for batch in loader:
+        batch = move_batch(batch, device)
+        y = batch["label"]
 
-    train_aug = CenteredOddOneOutAugment(
-        cfg=CenteredAugConfig(
-            p_permute=1.0,
-            p_geom=0.9,
-            max_rotate_deg=180.0,
-            max_translate_px=0.0,
-            max_scale_frac=0.00,
-            p_noise=0.0,
-            noise_std=0.00,
-            p_brightness=0.0,
-            brightness_frac=0.0,
-        ),
-        preprocess_cfg=preprocess_cfg,
-        norm_stats=norm_stats,
-    )
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(batch)
+        per_sample_loss = ce(logits, y)
 
-    # train on raw images + online augmentation
-    train_ds = OddOneOutDataset(x_train_raw[tr_idx], y=y_tr, augment=train_aug)
-
-    # validate on frozen normalized processed arrays
-    val_ds = DictDataset(slice_arrays(arrays, va_idx), y=y_va, train=False)
-
-    test_arrays = load_npz_arrays(args.test_npz)
-    test_ds = DictDataset(test_arrays, y=None, train=False)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=args.num_workers)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
-    model = OddOneOutNet(meta_dim=meta_dim).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"trainable params: {total_params:,}")
-    assert total_params <= 25_000, f"model too large: {total_params:,} > 25,000"
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    best_acc, best_state, bad = -1.0, None, 0
-
-    for epoch in range(1, args.epochs + 1):
-        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, device)
-        va_loss, va_acc = evaluate(model, val_loader, device)
-        scheduler.step()
-        print(f"epoch {epoch:03d} | train {tr_loss:.4f}/{tr_acc:.4f} | val {va_loss:.4f}/{va_acc:.4f}")
-
-        if va_acc > best_acc:
-            best_acc   = va_acc
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            bad        = 0
+        if 0.0 < hard_mining_frac < 1.0:
+            k = max(1, int(np.ceil(per_sample_loss.numel() * hard_mining_frac)))
+            loss = torch.topk(per_sample_loss, k=k, largest=True).values.mean()
         else:
-            bad += 1
-            if bad >= args.patience:
-                print("early stopping")
-                break
+            loss = per_sample_loss.mean()
 
-    model.load_state_dict(best_state)
-    torch.save(model.state_dict(), args.save_path)
-    print(f"best val acc: {best_acc:.4f}  →  saved to {args.save_path}")
+        loss.backward()
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
-    # optional public-half eval
-    y_test_path = os.path.join(args.data_dir, "y_test.npy")
-    if os.path.exists(y_test_path):
-        from sklearn.metrics import accuracy_score
-        y_test = np.load(y_test_path)
-        n      = min(len(y_test), len(test_ds))
-        pub_arrays = {k: v[:n] for k, v in test_arrays.items() if isinstance(v, np.ndarray)}
-        pub_ds     = DictDataset(pub_arrays, y=y_test[:n], train=False)
-        pub_loader = DataLoader(pub_ds, batch_size=args.batch_size, shuffle=False)
-        pub_preds  = predict(model, pub_loader, device)
-        print(f"public test acc (first {n}): {accuracy_score(y_test[:n], pub_preds):.4f}")
+        total_loss += per_sample_loss.mean().item() * y.size(0)
+        total_correct += (logits.argmax(dim=1) == y).sum().item()
+        total += y.size(0)
 
-    yh_test = predict(model, test_loader, device)
-    generate_csv_kaggle(yh_test)
-    print("wrote predicted_labels.csv")
+    return total_loss / max(total, 1), total_correct / max(total, 1)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--x-train", type=str, default="datasets/x_train.npy")
+    parser.add_argument("--x-test", type=str, default="datasets/x_test.npy")
+    parser.add_argument("--y-train", type=str, default="datasets/y_train.npy")
+    parser.add_argument("--y-test", type=str, default="datasets/y_test.npy", help="Optional labels for test/public subset evaluation")
+
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--stage1-epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--stage2-lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=2e-4)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--num-workers", type=int, default=0)
+
+    parser.add_argument("--cnn-dim", type=int, default=16)
+    parser.add_argument("--meta-out", type=int, default=2)
+    parser.add_argument("--d-model", type=int, default=16)
+    parser.add_argument("--dropout", type=float, default=0.10)
+
+    parser.add_argument("--tta-perms-val", type=int, default=4)
+    parser.add_argument("--tta-perms-test", type=int, default=8)
+
+    parser.add_argument("--out-size", type=int, default=32)
+    parser.add_argument("--inner-size", type=int, default=26)
+    parser.add_argument("--crop-pad", type=int, default=2)
+
+    parser.add_argument("--p-permute", type=float, default=1.0)
+    parser.add_argument("--p-geom", type=float, default=0.9)
+    parser.add_argument("--max-rotate-deg", type=float, default=180.0)
+    parser.add_argument("--max-translate-px", type=float, default=0.0)
+    parser.add_argument("--max-scale-frac", type=float, default=0.0)
+    parser.add_argument("--p-noise", type=float, default=0.0)
+    parser.add_argument("--noise-std", type=float, default=0.0)
+    parser.add_argument("--p-brightness", type=float, default=0.0)
+    parser.add_argument("--brightness-frac", type=float, default=0.0)
+
+    parser.add_argument("--stage2-hard-fraction", type=float, default=0.30)
+    parser.add_argument("--stage2-hard-weight", type=float, default=3.0)
+    parser.add_argument("--stage2-ohem-frac", type=float, default=1.0)
+
+    parser.add_argument("--save-model", type=str, default="best_model.pt")
+    parser.add_argument("--save-csv", type=str, default="predicted_labels.csv")
+    parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument("--fold", type=int, default=-1, help="Run one fold only; -1 means run all folds")
+
+    args = parser.parse_args()
+    seed_everything(args.seed)
+
+    if not (1 <= args.stage1_epochs <= args.epochs):
+        raise ValueError("--stage1-epochs must be between 1 and --epochs.")
+    if not (0.0 < args.stage2_hard_fraction <= 1.0):
+        raise ValueError("--stage2-hard-fraction must be in (0, 1].")
+    if not (0.0 < args.stage2_ohem_frac <= 1.0):
+        raise ValueError("--stage2-ohem-frac must be in (0, 1].")
+    if args.stage2_hard_weight < 1.0:
+        raise ValueError("--stage2-hard-weight must be >= 1.0.")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+
+    x_train = np.load(args.x_train).astype(np.float32)
+    x_test = np.load(args.x_test).astype(np.float32)
+    y_train = np.load(args.y_train).astype(np.int64)
+
+    if len(x_train) != len(y_train):
+        raise ValueError("Length mismatch between x_train and y_train.")
+    if x_train.ndim != 4 or x_train.shape[1] != 5:
+        raise ValueError(f"Expected x_train shape [N,5,H,W], got {x_train.shape}")
+    if x_test.ndim != 4 or x_test.shape[1] != 5:
+        raise ValueError(f"Expected x_test shape [N,5,H,W], got {x_test.shape}")
+
+    folds = make_stratified_folds(
+        y_train,
+        n_splits=args.n_splits,
+        shuffle=True,
+        random_state=args.seed,
+    )
+
+    fold_ids = range(args.n_splits) if args.fold < 0 else [args.fold]
+
+    preprocess_cfg = PreprocessConfig(
+        out_size=args.out_size,
+        inner_size=args.inner_size,
+        crop_pad=args.crop_pad,
+    )
+
+    aug_cfg = CenteredAugConfig(
+        p_permute=args.p_permute,
+        p_geom=args.p_geom,
+        max_rotate_deg=args.max_rotate_deg,
+        max_translate_px=args.max_translate_px,
+        max_scale_frac=args.max_scale_frac,
+        p_noise=args.p_noise,
+        noise_std=args.noise_std,
+        p_brightness=args.p_brightness,
+        brightness_frac=args.brightness_frac,
+    )
+
+    all_fold_scores = []
+    test_logits_sum = None
+
+    for fold_id in fold_ids:
+        tr_idx, va_idx = folds[fold_id]
+
+        x_tr = x_train[tr_idx]
+        y_tr = y_train[tr_idx]
+        x_va = x_train[va_idx]
+        y_va = y_train[va_idx]
+
+        processed_tr_for_stats, meta_names = preprocess_dataset(x_tr, preprocess_cfg)
+        norm_stats = compute_train_stats(processed_tr_for_stats)
+        processed_tr_for_eval = apply_normalization(processed_tr_for_stats, norm_stats)
+
+        processed_val, _ = preprocess_dataset(x_va, preprocess_cfg)
+        processed_val = apply_normalization(processed_val, norm_stats)
+
+        processed_test, _ = preprocess_dataset(x_test, preprocess_cfg)
+        processed_test = apply_normalization(processed_test, norm_stats)
+
+        train_augment = CenteredOddOneOutAugment(
+            cfg=aug_cfg,
+            preprocess_cfg=preprocess_cfg,
+            norm_stats=norm_stats,
+        )
+
+        train_ds = AugmentedTrainDataset(x=x_tr, y=y_tr, augment=train_augment)
+        train_eval_ds = GroupDataset(arrays=processed_tr_for_eval, labels=y_tr)
+        val_ds = GroupDataset(arrays=processed_val, labels=y_va)
+        test_ds = GroupDataset(arrays=processed_test, labels=None)
+
+        stage1_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        train_eval_loader = DataLoader(
+            train_eval_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        meta_dim = processed_tr_for_stats["meta"].shape[-1]
+        print(f"meta_dim: {meta_dim}")
+        print("meta names:", ", ".join(meta_names))
+
+        model = RelationOddOneOutNet(
+            meta_dim=meta_dim,
+            cnn_dim=args.cnn_dim,
+            meta_out=args.meta_out,
+            d_model=args.d_model,
+            dropout=args.dropout,
+        ).to(device)
+        print(f"trainable params: {count_trainable_params(model):,}")
+
+        best_state = None
+        best_val_acc = -1.0
+        best_val_loss = float("inf")
+        wait = 0
+
+        fold_model_path = args.save_model.replace(".pt", f"_fold{fold_id}.pt")
+
+        # -----------------
+        # Stage 1: standard training
+        # -----------------
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.stage1_epochs, 1))
+
+        for epoch in range(1, args.stage1_epochs + 1):
+            train_loss, train_acc = train_one_epoch(
+                model=model,
+                loader=stage1_loader,
+                optimizer=optimizer,
+                device=device,
+                grad_clip=args.grad_clip,
+                hard_mining_frac=1.0,
+            )
+            val_loss, val_acc = evaluate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                tta_perms=args.tta_perms_val,
+            )
+            scheduler.step()
+
+            print(
+                f"[stage1] epoch {epoch:03d} | "
+                f"train {train_loss:.4f}/{train_acc:.4f} | "
+                f"val {val_loss:.4f}/{val_acc:.4f}"
+            )
+
+            improved = (val_acc > best_val_acc + 1e-8) or (
+                abs(val_acc - best_val_acc) <= 1e-8 and val_loss < best_val_loss
+            )
+            if improved:
+                best_val_acc = val_acc
+                best_val_loss = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+                torch.save(best_state, fold_model_path)
+                wait = 0
+            else:
+                wait += 1
+                if wait >= args.patience:
+                    print("early stopping in stage 1")
+                    break
+
+        model.load_state_dict(best_state)
+
+        # -----------------
+        # Mine hard examples once using stage-1 model
+        # -----------------
+        train_losses = collect_per_sample_losses(model, train_eval_loader, device)
+        stage2_sampler, is_hard, hard_threshold = make_stage2_sampler(
+            losses=train_losses,
+            hard_fraction=args.stage2_hard_fraction,
+            hard_weight=args.stage2_hard_weight,
+        )
+
+        print(
+            f"[stage2] mined {is_hard.sum()}/{len(is_hard)} hard samples "
+            f"({100.0 * is_hard.mean():.1f}%) | "
+            f"loss threshold >= {hard_threshold:.4f}"
+        )
+
+        stage2_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            sampler=stage2_sampler,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+        )
+
+        # -----------------
+        # Stage 2: lower LR + hard-biased fine-tuning
+        # -----------------
+        remaining_epochs = args.epochs - args.stage1_epochs
+        if remaining_epochs > 0:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.stage2_lr,
+                weight_decay=args.weight_decay,
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(remaining_epochs, 1))
+            wait = 0
+
+            for epoch in range(args.stage1_epochs + 1, args.epochs + 1):
+                train_loss, train_acc = train_one_epoch(
+                    model=model,
+                    loader=stage2_loader,
+                    optimizer=optimizer,
+                    device=device,
+                    grad_clip=args.grad_clip,
+                    hard_mining_frac=args.stage2_ohem_frac,
+                )
+                val_loss, val_acc = evaluate(
+                    model=model,
+                    loader=val_loader,
+                    device=device,
+                    tta_perms=args.tta_perms_val,
+                )
+                scheduler.step()
+
+                print(
+                    f"[stage2] epoch {epoch:03d} | "
+                    f"ohem {args.stage2_ohem_frac:.2f} | "
+                    f"train {train_loss:.4f}/{train_acc:.4f} | "
+                    f"val {val_loss:.4f}/{val_acc:.4f}"
+                )
+
+                improved = (val_acc > best_val_acc + 1e-8) or (
+                    abs(val_acc - best_val_acc) <= 1e-8 and val_loss < best_val_loss
+                )
+                if improved:
+                    best_val_acc = val_acc
+                    best_val_loss = val_loss
+                    best_state = copy.deepcopy(model.state_dict())
+                    torch.save(best_state, fold_model_path)
+                    wait = 0
+                else:
+                    wait += 1
+                    if wait >= args.patience:
+                        print("early stopping in stage 2")
+                        break
+
+        model.load_state_dict(best_state)
+        all_fold_scores.append(best_val_acc)
+
+        model.eval()
+        fold_logits = []
+        with torch.no_grad():
+            for batch in test_loader:
+                batch = move_batch(batch, device)
+                logits = predict_logits_tta(model, batch, tta_perms=args.tta_perms_test)
+                fold_logits.append(logits.cpu())
+
+        fold_logits = torch.cat(fold_logits, dim=0)
+
+        if test_logits_sum is None:
+            test_logits_sum = fold_logits
+        else:
+            test_logits_sum += fold_logits
+
+    mean_test_logits = test_logits_sum / float(len(fold_ids))
+    preds = mean_test_logits.argmax(dim=1).numpy()
+
+    if args.y_test and os.path.exists(args.y_test):
+        y_test = np.load(args.y_test).astype(np.int64)
+        n_public = len(y_test)
+
+        if n_public <= len(preds):
+            public_logits = mean_test_logits[:n_public]
+            public_preds = public_logits.argmax(dim=1).numpy()
+            public_acc = (public_preds == y_test).mean()
+            print(f"public test acc: {public_acc:.4f}")
+        else:
+            print("Skipping y_test evaluation because y_test is longer than test set.")
+
+    print(f"mean CV acc: {np.mean(all_fold_scores):.4f}")
+    print(f"std CV acc: {np.std(all_fold_scores):.4f}")
+
+    with open(args.save_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Id", "Label"])
+        for i, p in enumerate(preds):
+            writer.writerow([i, int(p)])
+    print(f"wrote {args.save_csv}")
 
 
 if __name__ == "__main__":

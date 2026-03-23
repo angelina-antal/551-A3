@@ -9,19 +9,44 @@ import cv2
 import numpy as np
 
 #Helpers
+SOBEL_X = np.array(
+    [[-1.0, 0.0, 1.0],
+     [-2.0, 0.0, 2.0],
+     [-1.0, 0.0, 1.0]],
+    dtype=np.float32,
+)
+
+SOBEL_Y = np.array(
+    [[-1.0, -2.0, -1.0],
+     [ 0.0,  0.0,  0.0],
+     [ 1.0,  2.0,  1.0]],
+    dtype=np.float32,
+)
+
+LAPLACIAN = np.array(
+    [[ 0.0,  1.0, 0.0],
+     [ 1.0, -4.0, 1.0],
+     [ 0.0,  1.0, 0.0]],
+    dtype=np.float32,
+)
 
 def apply_normalization(
     processed: Dict[str, np.ndarray],
     stats: Dict[str, np.ndarray],
 ) -> Dict[str, np.ndarray]:
     centered_raw = processed["centered_raw"].astype(np.float32)
+    edge_stack = processed["edge_stack"].astype(np.float32)
     meta = processed["meta"].astype(np.float32)
 
     centered_raw = (centered_raw - stats["centered_raw_mean"]) / stats["centered_raw_std"]
+    edge_stack = (
+        edge_stack - stats["edge_mean"][None, None, :, None, None]
+    ) / stats["edge_std"][None, None, :, None, None]
     meta = (meta - stats["meta_mean"][None, None, :]) / stats["meta_std"][None, None, :]
 
     return {
         "centered_raw": centered_raw.astype(np.float32),
+        "edge_stack": edge_stack.astype(np.float32),
         "meta": meta.astype(np.float32),
     }
     
@@ -77,6 +102,35 @@ def paste_center_preserve_aspect(
 
 
 # Geometry/ feature extraction
+def compute_edge_stack(img01: np.ndarray) -> Tuple[np.ndarray, list]:
+    """
+    Matches the fixed edge channels from your edge-aware model:
+    sobel_x, sobel_y, laplacian
+    """
+    img01 = img01.astype(np.float32)
+
+    gx = cv2.filter2D(
+        img01,
+        ddepth=-1,
+        kernel=SOBEL_X,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    gy = cv2.filter2D(
+        img01,
+        ddepth=-1,
+        kernel=SOBEL_Y,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    lap = cv2.filter2D(
+        img01,
+        ddepth=-1,
+        kernel=LAPLACIAN,
+        borderType=cv2.BORDER_CONSTANT,
+    )
+
+    edge_stack = np.stack([gx, gy, lap], axis=0).astype(np.float32)
+    edge_names = ["sobel_x", "sobel_y", "laplacian"]
+    return edge_stack, edge_names
 
 def pca_stats(mask: np.ndarray) -> Dict[str, float]:
     ys, xs = np.where(mask > 0)
@@ -153,12 +207,12 @@ def hu_features(mask: np.ndarray) -> Dict[str, float]:
     return {f"hu_{i+1}": float(hu[i]) for i in range(7)}
 
 
+
 def compute_metadata(
     img01: np.ndarray,
-    feature_mask: np.ndarray,
 ) -> Tuple[np.ndarray, list]:
     h, w = img01.shape
-    ys, xs = np.where(feature_mask > 0)
+    ys, xs = np.where(img01 > 0)
 
     names = [
     "area_frac",
@@ -174,9 +228,9 @@ def compute_metadata(
     area_frac = area / float(h * w)
 
 
-    pca = pca_stats(feature_mask)
-    contour = contour_features(feature_mask, area)
-    hu = hu_features(feature_mask)
+    pca = pca_stats(img01)
+    contour = contour_features(img01, area)
+    hu = hu_features(img01)
 
     feat_dict = {
     "area_frac": area_frac,
@@ -196,7 +250,6 @@ def compute_metadata(
     return meta, names
 
 
-
 # Single-image preprocessing
 
 
@@ -205,16 +258,10 @@ def preprocess_single(
     out_size: int = 32,
     inner_size: int = 26,
     crop_pad: int = 2,
-    hard_threshold: float = 0.0001,
 ):
     raw = ensure_float01(img)
-
     center_mask = fixed_mask(raw, threshold=0.0)
-    hard_mask = fixed_mask(raw, threshold=hard_threshold)
-    if hard_mask.sum() == 0:
-        hard_mask = center_mask.copy()
-
-    meta, meta_names = compute_metadata(raw, hard_mask)
+    meta, meta_names = compute_metadata(raw)
 
     if center_mask.sum() == 0:
         centered_raw = np.zeros((out_size, out_size), dtype=np.float32)
@@ -228,10 +275,14 @@ def preprocess_single(
             interp=cv2.INTER_LINEAR,
         ).astype(np.float32)
 
+    edge_stack, edge_names = compute_edge_stack(centered_raw)
+
     return {
         "centered_raw": centered_raw,
+        "edge_stack": edge_stack,
         "meta": meta.astype(np.float32),
         "meta_names": meta_names,
+        "edge_names": edge_names,
     }
 
 
@@ -244,7 +295,6 @@ class PreprocessConfig:
     out_size: int = 32
     inner_size: int = 26
     crop_pad: int = 2
-    hard_threshold: float = 0.0001
 
 def preprocess_dataset(x: np.ndarray, cfg: PreprocessConfig):
     n, k, h, w = x.shape
@@ -254,13 +304,15 @@ def preprocess_dataset(x: np.ndarray, cfg: PreprocessConfig):
         out_size=cfg.out_size,
         inner_size=cfg.inner_size,
         crop_pad=cfg.crop_pad,
-        hard_threshold=cfg.hard_threshold,
     )
     meta_dim = len(first["meta"])
+    edge_ch = first["edge_stack"].shape[0]
     meta_names = first["meta_names"]
+    edge_names = first["edge_names"]
 
     out = {
         "centered_raw": np.zeros((n, k, cfg.out_size, cfg.out_size), dtype=np.float32),
+        "edge_stack": np.zeros((n, k, edge_ch, cfg.out_size, cfg.out_size), dtype=np.float32),
         "meta": np.zeros((n, k, meta_dim), dtype=np.float32),
     }
 
@@ -273,13 +325,12 @@ def preprocess_dataset(x: np.ndarray, cfg: PreprocessConfig):
                 out_size=cfg.out_size,
                 inner_size=cfg.inner_size,
                 crop_pad=cfg.crop_pad,
-                hard_threshold=cfg.hard_threshold,
             )
             out["centered_raw"][i, j] = p["centered_raw"]
+            out["edge_stack"][i, j] = p["edge_stack"]
             out["meta"][i, j] = p["meta"]
 
-    return out, meta_names
-
+    return out, meta_names, edge_names
 
 def compute_train_stats(processed_train: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     stats = {}
@@ -288,6 +339,10 @@ def compute_train_stats(processed_train: Dict[str, np.ndarray]) -> Dict[str, np.
     stats["centered_raw_mean"] = np.float32(arr.mean())
     stats["centered_raw_std"] = np.float32(arr.std() + 1e-6)
 
+    edge = processed_train["edge_stack"]
+    stats["edge_mean"] = edge.mean(axis=(0, 1, 3, 4)).astype(np.float32)  # [3]
+    stats["edge_std"] = (edge.std(axis=(0, 1, 3, 4)) + 1e-6).astype(np.float32)  # [3]
+
     meta = processed_train["meta"]
     stats["meta_mean"] = meta.mean(axis=(0, 1)).astype(np.float32)
     stats["meta_std"] = (meta.std(axis=(0, 1)) + 1e-6).astype(np.float32)
@@ -295,25 +350,30 @@ def compute_train_stats(processed_train: Dict[str, np.ndarray]) -> Dict[str, np.
     return stats
 
 
-def save_processed_npz(path: str, processed: Dict[str, np.ndarray], meta_names):
+def save_processed_npz(path: str, processed: Dict[str, np.ndarray], meta_names, edge_names):
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    np.savez_compressed(path, **processed, meta_names=np.asarray(meta_names, dtype=str))
+    np.savez_compressed(
+        path,
+        **processed,
+        meta_names=np.asarray(meta_names, dtype=str),
+        edge_names=np.asarray(edge_names, dtype=str),
+    )
+
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, default="datasets")
-    parser.add_argument("--out-train", type=str, default="datasets/processed_train_best.npz")
-    parser.add_argument("--out-test", type=str, default="datasets/processed_test_best.npz")
-    parser.add_argument("--out-stats", type=str, default="datasets/preprocess_stats_best.npz")
-    parser.add_argument("--out-config", type=str, default="datasets/preprocess_config_best.json")
+    parser.add_argument("--out-train", type=str, default="datasets/processed_train_area_edge.npz")
+    parser.add_argument("--out-test", type=str, default="datasets/processed_test_area_edge.npz")
+    parser.add_argument("--out-stats", type=str, default="datasets/preprocess_stats_area_edge.npz")
+    parser.add_argument("--out-config", type=str, default="datasets/preprocess_config_area_edge.json")
 
     parser.add_argument("--out-size", type=int, default=32)
     parser.add_argument("--inner-size", type=int, default=26)
     parser.add_argument("--crop-pad", type=int, default=2)
-    parser.add_argument("--hard-threshold", type=float, default=0.0001)
 
     args = parser.parse_args()
 
@@ -321,7 +381,6 @@ def main():
         out_size=args.out_size,
         inner_size=args.inner_size,
         crop_pad=args.crop_pad,
-        hard_threshold=args.hard_threshold,
     )
 
     x_train_path = os.path.join(args.data_dir, "x_train.npy")
@@ -336,10 +395,10 @@ def main():
     x_test = np.load(x_test_path)
 
     print("preprocessing train...")
-    processed_train, meta_names = preprocess_dataset(x_train, cfg)
+    processed_train, meta_names, edge_names = preprocess_dataset(x_train, cfg)
 
     print("preprocessing test...")
-    processed_test, _ = preprocess_dataset(x_test, cfg)
+    processed_test, _, _ = preprocess_dataset(x_test, cfg)
 
     print("computing train-only normalization stats...")
     stats = compute_train_stats(processed_train)
@@ -349,13 +408,18 @@ def main():
     processed_test = apply_normalization(processed_test, stats)
 
     print("saving outputs...")
-    save_processed_npz(args.out_train, processed_train, meta_names)
-    save_processed_npz(args.out_test, processed_test, meta_names)
+    save_processed_npz(args.out_train, processed_train, meta_names, edge_names)
+    save_processed_npz(args.out_test, processed_test, meta_names, edge_names)
 
     stats_parent = os.path.dirname(args.out_stats)
     if stats_parent:
         os.makedirs(stats_parent, exist_ok=True)
-    np.savez_compressed(args.out_stats, **stats, meta_names=np.asarray(meta_names, dtype=str))
+    np.savez_compressed(
+        args.out_stats,
+        **stats,
+        meta_names=np.asarray(meta_names, dtype=str),
+        edge_names=np.asarray(edge_names, dtype=str),
+    )
 
     config_parent = os.path.dirname(args.out_config)
     if config_parent:
@@ -371,6 +435,8 @@ def main():
     print(f"  {args.out_config}")
     print("\nMetadata names:")
     print(", ".join(meta_names))
+    print("\nEdge names:")
+    print(", ".join(edge_names))
 
 
 if __name__ == "__main__":
