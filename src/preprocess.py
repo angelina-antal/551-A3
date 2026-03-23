@@ -363,9 +363,6 @@ def main():
     with open(args.out_config, "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    with open(args.out_config, "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2)
-
     print("\nDone.")
     print("Saved:")
     print(f"  {args.out_train}")

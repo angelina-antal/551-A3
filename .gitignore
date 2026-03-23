@@ -1,7 +1,13 @@
-assignment3.ipynb
 explore/
 commands.txt
-datasets/
+datasets/*.npy
+datasets/processed_*.npz
+datasets/preprocess_*.npz
+datasets/preprocess_*.json
+!datasets/.gitkeep
+
+# Generated
+predicted_labels.csv
 # OS files
 .DS_Store
 Thumbs.db
