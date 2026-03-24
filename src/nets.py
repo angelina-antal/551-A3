@@ -12,8 +12,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from augment_edge import CenteredAugConfig, CenteredOddOneOutAugment
-from preprocess_edges import (
+from src.augment_edge import CenteredAugConfig, CenteredOddOneOutAugment
+from src.preprocess_edges import (
     PreprocessConfig,
     apply_normalization,
     compute_train_stats,
@@ -57,12 +57,15 @@ class GroupDataset(Dataset):
         labels: Optional[np.ndarray] = None,
     ) -> None:
         self.centered_raw = arrays["centered_raw"].astype(np.float32)
+        self.edge_stack = arrays["edge_stack"].astype(np.float32)
         self.meta = arrays["meta"].astype(np.float32)
         self.labels = None if labels is None else labels.astype(np.int64)
 
         assert self.centered_raw.ndim == 4, f"Expected [N, 5, H, W], got {self.centered_raw.shape}"
+        assert self.edge_stack.ndim == 5, f"Expected [N, 5, 3, H, W], got {self.edge_stack.shape}"
         assert self.meta.ndim == 3, f"Expected [N, 5, M], got {self.meta.shape}"
         assert self.centered_raw.shape[:2] == self.meta.shape[:2]
+        assert self.centered_raw.shape[:2] == self.edge_stack.shape[:2]
 
     def __len__(self) -> int:
         return self.centered_raw.shape[0]
@@ -70,6 +73,7 @@ class GroupDataset(Dataset):
     def __getitem__(self, idx: int):
         sample = {
             "centered_raw": maybe_to_tensor(self.centered_raw[idx]),
+            "edge_stack": maybe_to_tensor(self.edge_stack[idx]),
             "meta": maybe_to_tensor(self.meta[idx]),
         }
         if self.labels is not None:
@@ -89,9 +93,10 @@ class AugmentedTrainDataset(Dataset):
     def __getitem__(self, idx):
         imgs = self.x[idx]
         label = int(self.y[idx])
-        imgs, meta, label = self.augment(imgs, label)
+        imgs, edge_stack, meta, label = self.augment(imgs, label)
         return {
             "centered_raw": torch.from_numpy(imgs),
+            "edge_stack": torch.from_numpy(edge_stack),
             "meta": torch.from_numpy(meta),
             "label": torch.tensor(label, dtype=torch.long),
         }
@@ -496,14 +501,14 @@ def main() -> None:
         x_va = x_train[va_idx]
         y_va = y_train[va_idx]
 
-        processed_tr_for_stats, meta_names = preprocess_dataset(x_tr, preprocess_cfg)
+        processed_tr_for_stats, meta_names, edge_names = preprocess_dataset(x_tr, preprocess_cfg)
         norm_stats = compute_train_stats(processed_tr_for_stats)
         processed_tr_for_eval = apply_normalization(processed_tr_for_stats, norm_stats)
 
-        processed_val, _ = preprocess_dataset(x_va, preprocess_cfg)
+        processed_val, _, _ = preprocess_dataset(x_va, preprocess_cfg)
         processed_val = apply_normalization(processed_val, norm_stats)
 
-        processed_test, _ = preprocess_dataset(x_test, preprocess_cfg)
+        processed_test, _, _ = preprocess_dataset(x_test, preprocess_cfg)
         processed_test = apply_normalization(processed_test, norm_stats)
 
         train_augment = CenteredOddOneOutAugment(
@@ -549,6 +554,7 @@ def main() -> None:
         meta_dim = processed_tr_for_stats["meta"].shape[-1]
         print(f"meta_dim: {meta_dim}")
         print("meta names:", ", ".join(meta_names))
+        print("edge names:", ", ".join(edge_names))
 
         model = RelationOddOneOutNet(
             meta_dim=meta_dim,
