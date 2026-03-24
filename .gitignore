@@ -1,7 +1,8 @@
 explore/
 commands.txt
-datasets/
-src/net.py
+src/net18.py
+src/net19.py
+best*
 # OS files
 .DS_Store
 Thumbs.db

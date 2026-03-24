@@ -1,0 +1,6 @@
+{
+  "out_size": 32,
+  "inner_size": 26,
+  "crop_pad": 2,
+  "hard_threshold": 0.0001
+}
