@@ -1,7 +1,3 @@
-# src/augment.py
-#
-# If your files are not inside src/, change the import below.
-
 import random
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -11,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.preprocess_edges import preprocess_single, PreprocessConfig
+from src.preprocess import preprocess_single, PreprocessConfig
 
 
 @dataclass
@@ -20,16 +16,6 @@ class CenteredAugConfig:
 
     p_geom: float = 0.9
     max_rotate_deg: float = 180.0
-    max_translate_px: float = 0.0
-    max_scale_frac: float = 0.00
-
-    p_noise: float = 0.0
-    noise_std: float = 0.00
-
-    p_brightness: float = 0.0
-    brightness_frac: float = 0.0
-
-    meta_threshold: float = 0.0001
 
     clip_min: float = 0.0
     clip_max: float = 1.0
@@ -45,16 +31,11 @@ def _ensure_float01(img: np.ndarray) -> np.ndarray:
 def _warp_centered_image(
     img: np.ndarray,
     angle_deg: float,
-    tx: float,
-    ty: float,
-    scale: float,
 ) -> np.ndarray:
     h, w = img.shape
     center = (w / 2.0, h / 2.0)
 
-    M = cv2.getRotationMatrix2D(center, angle_deg, scale)
-    M[0, 2] += tx
-    M[1, 2] += ty
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
 
     out = cv2.warpAffine(
         img.astype(np.float32),
@@ -78,11 +59,10 @@ class CenteredOddOneOutAugment:
         self.preprocess_cfg = preprocess_cfg
         self.norm_stats = norm_stats
 
-    def _normalize(self, imgs: np.ndarray, edge_stack: np.ndarray, meta: np.ndarray):
+    def _normalize(self, imgs: np.ndarray, meta: np.ndarray):
         if self.norm_stats is None:
             return (
                 imgs.astype(np.float32),
-                edge_stack.astype(np.float32),
                 meta.astype(np.float32),
             )
 
@@ -90,33 +70,22 @@ class CenteredOddOneOutAugment:
             imgs - float(self.norm_stats["centered_raw_mean"])
         ) / float(self.norm_stats["centered_raw_std"])
 
-        edge_stack = (
-            edge_stack - self.norm_stats["edge_mean"][None, :, None, None]
-        ) / self.norm_stats["edge_std"][None, :, None, None]
-
         meta = (
             meta - self.norm_stats["meta_mean"][None, :]
         ) / self.norm_stats["meta_std"][None, :]
 
         return (
             imgs.astype(np.float32),
-            edge_stack.astype(np.float32),
             meta.astype(np.float32),
         )
+
     def _sample_geom_params(self):
         if random.random() >= self.cfg.p_geom:
             return None
 
         return {
-            "angle": random.uniform(-self.cfg.max_rotate_deg, self.cfg.max_rotate_deg),
-            "tx": random.uniform(-self.cfg.max_translate_px, self.cfg.max_translate_px),
-            "ty": random.uniform(-self.cfg.max_translate_px, self.cfg.max_translate_px),
-            "scale": random.uniform(
-                1.0 - self.cfg.max_scale_frac,
-                1.0 + self.cfg.max_scale_frac,
-            ),
+            "angle": random.uniform(-self.cfg.max_rotate_deg, self.cfg.max_rotate_deg)
         }
-
 
     def _augment_one_image(self, img: np.ndarray, geom_params=None) -> np.ndarray:
         img = _ensure_float01(img)
@@ -124,26 +93,8 @@ class CenteredOddOneOutAugment:
         if geom_params is not None:
             img = _warp_centered_image(
                 img=img,
-                angle_deg=geom_params["angle"],
-                tx=geom_params["tx"],
-                ty=geom_params["ty"],
-                scale=geom_params["scale"],
+                angle_deg=geom_params["angle"]
             )
-
-        if self.cfg.p_brightness > 0.0 and random.random() < self.cfg.p_brightness:
-            gain = random.uniform(
-                1.0 - self.cfg.brightness_frac,
-                1.0 + self.cfg.brightness_frac,
-            )
-            img = img * gain
-
-        if self.cfg.p_noise > 0.0 and random.random() < self.cfg.p_noise:
-            noise = np.random.normal(
-                loc=0.0,
-                scale=self.cfg.noise_std,
-                size=img.shape,
-            ).astype(np.float32)
-            img = img + noise
 
         return np.clip(img, self.cfg.clip_min, self.cfg.clip_max).astype(np.float32)
 
@@ -159,11 +110,9 @@ class CenteredOddOneOutAugment:
             out = out[perm]
             y = int(np.where(perm == y)[0][0])
 
-        # sample ONE shared transform for the whole 5-image set
         geom_params = self._sample_geom_params()
 
         proc_imgs = []
-        proc_edges = []
         proc_meta = []
 
         for i in range(5):
@@ -177,15 +126,13 @@ class CenteredOddOneOutAugment:
             )
 
             proc_imgs.append(p["centered_raw"])
-            proc_edges.append(p["edge_stack"])
             proc_meta.append(p["meta"])
 
         out = np.stack(proc_imgs, axis=0).astype(np.float32)
-        edge_stack = np.stack(proc_edges, axis=0).astype(np.float32)
         meta = np.stack(proc_meta, axis=0).astype(np.float32)
 
-        out, edge_stack, meta = self._normalize(out, edge_stack, meta)
-        return out, edge_stack, meta, y
+        out, meta = self._normalize(out, meta)
+        return out, meta, y
 
 
 class CenteredOddOneOutEvalTransform:
@@ -197,11 +144,10 @@ class CenteredOddOneOutEvalTransform:
         self.preprocess_cfg = preprocess_cfg
         self.norm_stats = norm_stats
 
-    def _normalize(self, imgs: np.ndarray, edge_stack: np.ndarray, meta: np.ndarray):
+    def _normalize(self, imgs: np.ndarray, meta: np.ndarray):
         if self.norm_stats is None:
             return (
                 imgs.astype(np.float32),
-                edge_stack.astype(np.float32),
                 meta.astype(np.float32),
             )
 
@@ -209,17 +155,12 @@ class CenteredOddOneOutEvalTransform:
             imgs - float(self.norm_stats["centered_raw_mean"])
         ) / float(self.norm_stats["centered_raw_std"])
 
-        edge_stack = (
-            edge_stack - self.norm_stats["edge_mean"][None, :, None, None]
-        ) / self.norm_stats["edge_std"][None, :, None, None]
-
         meta = (
             meta - self.norm_stats["meta_mean"][None, :]
         ) / self.norm_stats["meta_std"][None, :]
 
         return (
             imgs.astype(np.float32),
-            edge_stack.astype(np.float32),
             meta.astype(np.float32),
         )
 
@@ -228,7 +169,6 @@ class CenteredOddOneOutEvalTransform:
         assert imgs.ndim == 3 and imgs.shape[0] == 5, f"Expected (5,H,W), got {imgs.shape}"
 
         proc_imgs = []
-        proc_edges = []
         proc_meta = []
 
         for i in range(5):
@@ -242,15 +182,13 @@ class CenteredOddOneOutEvalTransform:
             )
 
             proc_imgs.append(p["centered_raw"])
-            proc_edges.append(p["edge_stack"])
             proc_meta.append(p["meta"])
 
         out = np.stack(proc_imgs, axis=0).astype(np.float32)
-        edge_stack = np.stack(proc_edges, axis=0).astype(np.float32)
         meta = np.stack(proc_meta, axis=0).astype(np.float32)
 
-        out, edge_stack, meta = self._normalize(out, edge_stack, meta)
-        return out, edge_stack, meta, int(label)
+        out, meta = self._normalize(out, meta)
+        return out, meta, int(label)
 
 
 class OddOneOutDataset(Dataset):
@@ -269,11 +207,10 @@ class OddOneOutDataset(Dataset):
         if self.transform is None:
             raise RuntimeError("A transform must be provided for both train and validation.")
 
-        imgs, edge_stack, meta, label = self.transform(imgs, label)
+        imgs, meta, label = self.transform(imgs, label)
 
         sample = {
             "centered_raw": torch.from_numpy(imgs),
-            "edge_stack": torch.from_numpy(edge_stack),
             "meta": torch.from_numpy(meta),
         }
 

@@ -9,7 +9,7 @@ def make_stratified_folds(
     random_state: int = 42,
 ):
     y = np.asarray(y)
-    dummy_x = np.zeros(len(y))  # skf needs X, but we only stratify on y
+    dummy_x = np.zeros(len(y)) 
 
     skf = StratifiedKFold(
         n_splits=n_splits,
