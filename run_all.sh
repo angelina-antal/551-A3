@@ -9,7 +9,7 @@ python -m src.preprocess --data-dir "$DATA_DIR"
 
 echo ""
 echo "=== 2. Train ==="
-python -m src.nets --data-dir "$DATA_DIR"
+python -m src.net17
 
 echo ""
 echo "=== Done ==="
