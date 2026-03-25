@@ -93,7 +93,7 @@ class CenteredOddOneOutAugment:
         if geom_params is not None:
             img = _warp_centered_image(
                 img=img,
-                angle_deg=geom_params["angle"]
+                angle_deg=geom_params["angle"],
             )
 
         return np.clip(img, self.cfg.clip_min, self.cfg.clip_max).astype(np.float32)
@@ -110,12 +110,13 @@ class CenteredOddOneOutAugment:
             out = out[perm]
             y = int(np.where(perm == y)[0][0])
 
-        geom_params = self._sample_geom_params()
-
         proc_imgs = []
         proc_meta = []
 
         for i in range(5):
+            # Each item gets its own independent rotation decision and angle.
+            geom_params = self._sample_geom_params()
+
             aug_img = self._augment_one_image(out[i], geom_params=geom_params)
 
             p = preprocess_single(
